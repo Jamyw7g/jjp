@@ -1,0 +1,26 @@
+[package]
+name = "jjp"
+version = "0.1.0"
+authors = ["wuyaoping <jamykp@gmail.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+getopts = "0.2"
+anyhow = "1.0.65"
+memmap2 = "0.5.7"
+reqwest = { version = "0.11.12", features = ["socks"] }
+tokio = { version = "1.21.2", features = ["rt", "fs", "time"] }
+
+
+[[example]]
+name = "file"
+
+[dev-dependencies]
+tokio = { version = "1.21.2", features = ["full"] }
+
+[profile.release]
+opt-level = "z"
+strip = "debuginfo"
+panic = "abort"
