@@ -1,6 +1,6 @@
 use getopts::Options;
-use jjp::JjpBuilder;
-use reqwest::Proxy;
+
+use jjp::JjPBuilder;
 
 fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -8,16 +8,8 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     let mut opts = Options::new();
-    opts.optflag("", "no-mmap", "Default using mmap, disable mmap.")
-        .optopt("o", "output", "Output filename.", "FILE")
+    opts.optopt("o", "output", "Output filename.", "FILE")
         .optopt("p", "parallel", "Parallel number.", "PARALLEL")
-        .optopt(
-            "x",
-            "proxy",
-            "Default using env Proxy, support HTTP, Socks5.",
-            "PROXY",
-        )
-        .optflag("", "no-proxy", "Disable using proxy.")
         .optflag("h", "help", "Show this help.");
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -27,9 +19,6 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let output = matches.opt_str("o");
-    let no_mmap = matches.opt_present("no-mmap");
-    let proxy = matches.opt_str("x");
-    let no_proxy = matches.opt_present("no-proxy");
     let parallel = matches.opt_str("p");
 
     let url = if !matches.free.is_empty() {
@@ -39,24 +28,17 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     rt.block_on(async move {
-        let mut jpb = JjpBuilder::new(url)?;
-        if let Some(proxy) = proxy {
-            let proxy = Proxy::all(proxy)?;
-            jpb = jpb.proxy(proxy);
+        let mut jjp_builder = JjPBuilder::new(url);
+        if let Some(output) = output {
+            jjp_builder = jjp_builder.set_filename(output);
         }
-        if let Some(pa) = parallel {
-            let num = pa.parse()?;
-            jpb = jpb.parallel_num(num);
+        if let Some(parallel) = parallel {
+            if let Ok(parallel) = parallel.parse() {
+                jjp_builder = jjp_builder.set_parallel_num(parallel);    
+            }
         }
-        if let Some(name) = output {
-            jpb = jpb.name(name);
-        }
-        jpb = jpb.no_proxy(no_proxy);
-        jpb = jpb.mmap(!no_mmap);
-
-        let mut jjp = jpb.build().await?;
-        jjp.run().await?;
-
+        let jjp = jjp_builder.build()?;
+        jjp.parallel_download().await?;
         Ok(())
     })
 }

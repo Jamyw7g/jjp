@@ -9,18 +9,13 @@ edition = "2021"
 [dependencies]
 getopts = "0.2"
 anyhow = "1.0.65"
-memmap2 = "0.5.7"
-reqwest = { version = "0.11.12", features = ["socks"] }
-tokio = { version = "1.21.2", features = ["rt", "fs", "time"] }
-
-
-[[example]]
-name = "file"
+reqwest = { version = "0.11.26", features = ["socks", "stream"] }
+tokio = { version = "1.36.0", features = ["rt", "fs", "time"] }
+futures = "0.3.30"
 
 [dev-dependencies]
-tokio = { version = "1.21.2", features = ["full"] }
+tokio = { version = "1.36.0", features = ["full"] }
 
 [profile.release]
-opt-level = "z"
 strip = "debuginfo"
 panic = "abort"
