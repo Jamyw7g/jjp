@@ -208,12 +208,13 @@ impl JjP {
     }
 
     async fn parallel_download(&self, length: usize) -> anyhow::Result<()> {
-        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(self.parallel_num);
-        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
         let filename = self.filename.clone();
-        let parallel_num = self.parallel_num;
+        let parallel_num = std::cmp::max(1, std::cmp::min(length / self.chunk_len, self.parallel_num));
 
         let mut abort_handles = Vec::new();
+
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(parallel_num);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
 
         abort_handles.push(
             tokio::spawn(async move {
@@ -223,8 +224,8 @@ impl JjP {
             .abort_handle(),
         );
 
-        let download_semap = Arc::new(Semaphore::new(self.parallel_num));
-        let fail_semap = Arc::new(Semaphore::new(self.parallel_num));
+        let download_semap = Arc::new(Semaphore::new(parallel_num));
+        let fail_semap = Arc::new(Semaphore::new(parallel_num));
 
         for start in (0..length).step_by(self.chunk_len) {
             // fallback to single download
