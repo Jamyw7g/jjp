@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         let jjp = jjp_builder.build()?;
-        jjp.parallel_download().await?;
+        jjp.download().await?;
         Ok(())
     })
 }

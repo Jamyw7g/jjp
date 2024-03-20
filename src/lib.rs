@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::StreamExt;
 use reqwest::{
     header::{HeaderMap, CONTENT_RANGE, RANGE},
     Client,
@@ -28,6 +28,8 @@ pub struct JjPBuilder {
 }
 
 impl JjPBuilder {
+    const CHUNK_LEN: usize = (1 << 20) * 32;
+
     pub fn new(url: String) -> Self {
         Self {
             url,
@@ -75,10 +77,8 @@ impl JjPBuilder {
                 .get()
         });
         let max_retries = self.max_retries.unwrap_or(3);
-
-        let (tx, rx) = tokio::sync::mpsc::channel(parallel_num);
         let headers = self.headers.unwrap_or_default();
-        let chunk_len = self.chunk_len.unwrap_or((1 << 20) * 8);
+        let chunk_len = self.chunk_len.unwrap_or(Self::CHUNK_LEN);
 
         Ok(JjP {
             client,
@@ -88,8 +88,6 @@ impl JjPBuilder {
             parallel_num,
             max_retries,
             chunk_len,
-            tx,
-            rx,
         })
     }
 }
@@ -103,92 +101,24 @@ pub struct JjP {
     parallel_num: usize,
     max_retries: usize,
     chunk_len: usize,
-
-    tx: Sender<usize>,
-    rx: Receiver<usize>,
 }
 
 impl JjP {
-    pub async fn parallel_download(self) -> anyhow::Result<()> {
+    pub async fn download(self) -> anyhow::Result<()> {
         let length = self.fetch_length().await;
         if tokio::fs::try_exists(&self.filename).await? {
             tokio::fs::remove_file(&self.filename).await?;
         }
 
-        let mut group = FuturesUnordered::new();
-        let rx = self.rx;
-        let filename = self.filename.clone();
-        let parallel_num = self.parallel_num;
-        group.push(tokio::spawn(async move {
-            let total_len = length.map(|len| len.get()).unwrap_or_default();
-            progress(filename, total_len, parallel_num, rx).await;
-            Ok::<_, anyhow::Error>(())
-        }));
-
-        let download_semap = Arc::new(Semaphore::new(self.parallel_num));
         if let Some(length) = length {
             let length = length.get();
-            for start in (0..length).step_by(self.chunk_len) {
-                let end = length.min(start + self.chunk_len) - 1;
-                let mut headers = self.headers.clone();
-                headers.insert(RANGE, format!("bytes={}-{}", start, end).try_into()?);
-
-                let segment_length = end - start + 1;
-                let client = self.client.clone();
-                let progress_tx = self.tx.clone();
-                let filename = self.filename.clone();
-                let url = self.url.clone();
-                let download_semap = download_semap.clone();
-                let max_retries = self.max_retries;
-                let headers = headers.clone();
-                group.push(tokio::spawn(async move {
-                    let _semap = download_semap.acquire_owned().await?;
-
-                    let mut chunk = download_core(
-                        &client,
-                        &url,
-                        &filename,
-                        headers.clone(),
-                        start,
-                        segment_length,
-                        &progress_tx,
-                    )
-                    .await;
-                    let mut retries = 0;
-                    while let Err(_) = chunk {
-                        if retries >= max_retries {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("retries {}, max_retries: {}", retries, max_retries),
-                            )
-                            .into());
-                        }
-                        chunk = download_core(
-                            &client,
-                            &url,
-                            &filename,
-                            headers.clone(),
-                            start,
-                            segment_length,
-                            &progress_tx,
-                        )
-                        .await;
-                        retries += 1;
-                    }
-                    Ok(())
-                }));
+            if self.parallel_num == 1 {
+                self.single_download(length).await?;
+            } else {
+                self.parallel_download(length).await?;
             }
         } else {
-            println!("unkown length");
-        }
-
-        drop(self.tx);
-        while let Some(join) = group.next().await {
-            match join {
-                Ok(Ok(_)) => (),
-                Ok(Err(e)) => println!("download error: {e:?}"),
-                Err(e) => println!("group error: {e:?}"),
-            }
+            self.single_download(0).await?;
         }
 
         Ok(())
@@ -211,6 +141,169 @@ impl JjP {
             .parse()
             .ok()
     }
+
+    async fn single_download(&self, length: usize) -> anyhow::Result<()> {
+        let Self {
+            client,
+            url,
+            filename,
+            headers,
+            max_retries,
+            ..
+        } = self;
+
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(1);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        let p_filename = filename.clone();
+        let res_abort_hanlde = tokio::spawn(async move {
+            progress(p_filename, length, 1, progress_rx).await;
+            let _ = res_tx.send(());
+        });
+
+        let mut chunk = download_core(
+            client,
+            url,
+            filename,
+            headers.clone(),
+            0,
+            length,
+            &progress_tx,
+        )
+        .await;
+        let mut retries = 0;
+        while let Err(ref e) = chunk {
+            println!("{}", e);
+            if retries >= *max_retries {
+                res_abort_hanlde.abort();
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("single download retries: {}", retries),
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(
+                std::cmp::min(retries * 100, 1000) as u64
+            ))
+            .await;
+            retries += 1;
+            chunk = download_core(
+                client,
+                url,
+                filename,
+                headers.clone(),
+                0,
+                length,
+                &progress_tx,
+            )
+            .await;
+        }
+        drop(progress_tx);
+        match res_rx.await {
+            Ok(_) => {
+                println!("\nDone.");
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn parallel_download(&self, length: usize) -> anyhow::Result<()> {
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(self.parallel_num);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        let filename = self.filename.clone();
+        let parallel_num = self.parallel_num;
+
+        let mut abort_handles = Vec::new();
+
+        abort_handles.push(
+            tokio::spawn(async move {
+                progress(filename, length, parallel_num, progress_rx).await;
+                let _ = res_tx.send(());
+            })
+            .abort_handle(),
+        );
+
+        let download_semap = Arc::new(Semaphore::new(self.parallel_num));
+        let fail_semap = Arc::new(Semaphore::new(self.parallel_num));
+
+        for start in (0..length).step_by(self.chunk_len) {
+            // fallback to single download
+            if fail_semap.clone().try_acquire_owned().is_err() {
+                for handle in abort_handles {
+                    handle.abort();
+                }
+                return self.single_download(length).await;
+            }
+
+            let owned = match tokio::time::timeout(
+                Duration::from_secs(3),
+                download_semap.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(owned)) => owned,
+                _ => continue,
+            };
+            let end = length.min(start + self.chunk_len) - 1;
+            let mut headers = self.headers.clone();
+            headers.insert(RANGE, format!("bytes={}-{}", start, end).try_into()?);
+
+            let segment_length = end - start + 1;
+            let client = self.client.clone();
+            let progress_tx = progress_tx.clone();
+            let filename = self.filename.clone();
+            let url = self.url.clone();
+            let headers = headers.clone();
+            let fail_semap = fail_semap.clone();
+            abort_handles.push(
+                tokio::spawn(async move {
+                    let mut chunk = download_core(
+                        &client,
+                        &url,
+                        &filename,
+                        headers.clone(),
+                        start,
+                        segment_length,
+                        &progress_tx,
+                    )
+                    .await;
+                    let mut retries = 0;
+                    while let Err(ref e) = chunk {
+                        println!("{}", e);
+                        let fail_owned = fail_semap.clone().acquire_owned().await?;
+                        tokio::time::sleep(Duration::from_millis(std::cmp::min(
+                            retries * 100 + 100,
+                            3000,
+                        )))
+                        .await;
+                        chunk = download_core(
+                            &client,
+                            &url,
+                            &filename,
+                            headers.clone(),
+                            start,
+                            segment_length,
+                            &progress_tx,
+                        )
+                        .await;
+                        retries += 1;
+                        drop(fail_owned);
+                    }
+                    drop(owned);
+                    Ok::<_, anyhow::Error>(())
+                })
+                .abort_handle(),
+            );
+        }
+        drop(progress_tx);
+        match res_rx.await {
+            Ok(_) => {
+                println!("\nDone.");
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 async fn download_core(
@@ -220,7 +313,7 @@ async fn download_core(
     headers: HeaderMap,
     start: usize,
     length: usize,
-    progress_tx: &Sender<usize>,
+    progress_tx: &Sender<isize>,
 ) -> anyhow::Result<()> {
     let mut bytes_stream = client
         .get(url)
@@ -234,17 +327,24 @@ async fn download_core(
         .open(&filename)
         .await?;
     file.seek(SeekFrom::Start(start as u64)).await?;
-
     let mut written_len = 0;
     let mut buf_writer = BufWriter::new(file);
     while let Some(bytes) = bytes_stream.next().await {
-        let bytes = bytes?;
-        buf_writer.write_all(&bytes).await?;
-        progress_tx.send(bytes.len()).await?;
-        written_len += bytes.len();
+        match bytes {
+            Ok(bytes) => {
+                buf_writer.write_all(&bytes).await?;
+                progress_tx.send(bytes.len() as isize).await?;
+                written_len += bytes.len();
+            }
+            Err(e) => {
+                progress_tx.send(-(written_len as isize)).await?;
+                return Err(e.into());
+            }
+        }
     }
     buf_writer.flush().await?;
     if length != 0 && length != written_len {
+        progress_tx.send(-(written_len as isize)).await?;
         return Err(io::Error::new(
             io::ErrorKind::Other,
             format!(
@@ -256,46 +356,74 @@ async fn download_core(
     Ok(())
 }
 
-async fn progress(filename: String, size: usize, parallel_num: usize, mut rx: Receiver<usize>) {
-    const PART_DURATION: u64 = 1;
+async fn progress(filename: String, size: usize, parallel_num: usize, mut rx: Receiver<isize>) {
+    const PART_DURATION: f32 = 1.0;
 
-    let mut now = Instant::now();
     let mut segement_len = 0;
     let mut total_len = 0;
-    let cal_fn = |total_len: usize, seg_len: usize, dur: u64| {
-        if total_len == 0 || dur == 0 {
+    let size_str = to_human(size as f32);
+    let cal_fn = |total_len: isize, seg_len: isize, dur: f32| {
+        if total_len <= 0 || dur < f32::EPSILON || seg_len < 0 {
             return;
         }
-        let speed = seg_len as u64 / dur;
-        let percent = total_len as f32 / size as f32;
-        print!("\rf:{} c:{} p:{:.02}% s:{} ", filename, parallel_num, (100.0 * percent), to_human(speed as f32));
+        let speed = seg_len as f32 / dur;
+        let percent = if size == 0 {
+            0.0
+        } else {
+            total_len as f32 / size as f32
+        };
+        print!(
+            "\rf:{} c:{} p:{:.02}% ps:{}/{} s:{}/s ",
+            filename,
+            parallel_num,
+            (100.0 * percent),
+            to_human(total_len as f32),
+            size_str,
+            to_human(speed as f32)
+        );
         std::io::stdout().flush().unwrap();
     };
-    while let Some(recv_len) = rx.recv().await {
-        let elapsed = now.elapsed().as_secs();
-        segement_len += recv_len;
-        total_len += recv_len;
-        if elapsed < PART_DURATION {
-            continue;
+    let mut now = Instant::now();
+
+    let mut part_flag: f32 = 0.0;
+
+    loop {
+        part_flag += 0.1;
+        part_flag = part_flag.min(PART_DURATION);
+        match tokio::time::timeout(Duration::from_secs_f32(PART_DURATION), rx.recv()).await {
+            Ok(Some(recv_len)) => {
+                segement_len += recv_len;
+                total_len += recv_len;
+                let elapsed = now.elapsed().as_secs_f32();
+                if elapsed < part_flag {
+                    continue;
+                }
+                cal_fn(total_len, segement_len, elapsed);
+                now = Instant::now();
+                segement_len = 0;
+            }
+            timeout_or_ok => {
+                let elapsed = now.elapsed().as_secs_f32();
+                cal_fn(total_len, segement_len, elapsed);
+                now = Instant::now();
+                segement_len = 0;
+                if timeout_or_ok.is_ok() {
+                    break;
+                }
+            }
         }
-        now = Instant::now();
-        cal_fn(total_len, segement_len, elapsed);
-        segement_len = 0;
     }
-    let elapsed = now.elapsed().as_secs();
-    cal_fn(total_len, segement_len, elapsed);
-    println!("Done.");
 }
 
 #[inline(always)]
 fn to_human(mut speed: f32) -> String {
-    const UNITS: [&str; 5] = ["bytes", "Kbytes", "Mbytes", "Gbytes", "Tbytes"];
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     const STEP: f32 = 1024.0;
     let mut index = 0;
 
-    while speed > STEP && index+1 < UNITS.len() {
+    while speed > STEP && index + 1 < UNITS.len() {
         speed /= STEP;
         index += 1;
     }
-    format!("{:.02} {}", speed, UNITS[index])
+    format!("{:.02}{}", speed, UNITS[index])
 }
