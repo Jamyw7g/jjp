@@ -1,7 +1,11 @@
 use std::{
+    collections::VecDeque,
     io::{self, SeekFrom, Write},
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -10,11 +14,17 @@ use reqwest::{
     header::{HeaderMap, CONTENT_RANGE, RANGE},
     Client,
 };
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::{
     fs::OpenOptions,
     io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
     sync::Semaphore,
+};
+use tokio::{
+    sync::{
+        mpsc::{Receiver, Sender},
+        oneshot::error::TryRecvError,
+    },
+    task::AbortHandle,
 };
 
 #[derive(Debug, Default)]
@@ -209,42 +219,58 @@ impl JjP {
 
     async fn parallel_download(&self, length: usize) -> anyhow::Result<()> {
         let filename = self.filename.clone();
-        let parallel_num = std::cmp::max(1, std::cmp::min(length / self.chunk_len, self.parallel_num));
+        let parallel_num =
+            std::cmp::max(1, std::cmp::min(length / self.chunk_len, self.parallel_num));
 
-        let mut abort_handles = Vec::new();
+        if parallel_num == 1 {
+            return self.single_download(length).await;
+        }
+
+        static CHANGE_SINGLE: AtomicBool = AtomicBool::new(false);
 
         let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(parallel_num);
-        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        let (res_tx, mut res_rx) = tokio::sync::oneshot::channel();
+        let (join_tx, mut join_rx) = tokio::sync::mpsc::channel::<AbortHandle>(parallel_num);
 
-        abort_handles.push(
-            tokio::spawn(async move {
-                progress(filename, length, parallel_num, progress_rx).await;
-                let _ = res_tx.send(());
-            })
-            .abort_handle(),
-        );
+        let abort_handle = tokio::spawn(async move {
+            let mut handles = VecDeque::with_capacity(parallel_num + 1);
+            loop {
+                match tokio::time::timeout(Duration::from_millis(100), join_rx.recv()).await {
+                    Ok(Some(h)) => handles.push_back(h),
+                    Ok(None) => break,
+                    _ => (),
+                }
+                if CHANGE_SINGLE.load(Ordering::Relaxed) {
+                    for h in handles {
+                        h.abort();
+                    }
+                    break;
+                }
+                if handles.len() > parallel_num {
+                    let _ = handles.pop_front();
+                }
+            }
+        });
+        join_tx
+            .send(
+                tokio::spawn(async move {
+                    progress(filename, length, parallel_num, progress_rx).await;
+                    let _ = res_tx.send(());
+                })
+                .abort_handle(),
+            )
+            .await?;
 
         let download_semap = Arc::new(Semaphore::new(parallel_num));
-        let fail_semap = Arc::new(Semaphore::new(parallel_num));
+        let fail_semap = Arc::new(Semaphore::new(parallel_num - 1));
 
         for start in (0..length).step_by(self.chunk_len) {
             // fallback to single download
-            if fail_semap.clone().try_acquire_owned().is_err() {
-                for handle in abort_handles {
-                    handle.abort();
-                }
-                return self.single_download(length).await;
+            if CHANGE_SINGLE.load(Ordering::Relaxed) {
+                break;
             }
 
-            let owned = match tokio::time::timeout(
-                Duration::from_secs(3),
-                download_semap.clone().acquire_owned(),
-            )
-            .await
-            {
-                Ok(Ok(owned)) => owned,
-                _ => continue,
-            };
+            let owned = download_semap.clone().acquire_owned().await?;
             let end = length.min(start + self.chunk_len) - 1;
             let mut headers = self.headers.clone();
             headers.insert(RANGE, format!("bytes={}-{}", start, end).try_into()?);
@@ -256,28 +282,10 @@ impl JjP {
             let url = self.url.clone();
             let headers = headers.clone();
             let fail_semap = fail_semap.clone();
-            abort_handles.push(
-                tokio::spawn(async move {
-                    let mut chunk = download_core(
-                        &client,
-                        &url,
-                        &filename,
-                        headers.clone(),
-                        start,
-                        segment_length,
-                        &progress_tx,
-                    )
-                    .await;
-                    let mut retries = 0;
-                    while let Err(ref e) = chunk {
-                        println!("{}", e);
-                        let fail_owned = fail_semap.clone().acquire_owned().await?;
-                        tokio::time::sleep(Duration::from_millis(std::cmp::min(
-                            retries * 100 + 100,
-                            3000,
-                        )))
-                        .await;
-                        chunk = download_core(
+            join_tx
+                .send(
+                    tokio::spawn(async move {
+                        let mut chunk = download_core(
                             &client,
                             &url,
                             &filename,
@@ -287,22 +295,53 @@ impl JjP {
                             &progress_tx,
                         )
                         .await;
-                        retries += 1;
-                        drop(fail_owned);
-                    }
-                    drop(owned);
-                    Ok::<_, anyhow::Error>(())
-                })
-                .abort_handle(),
-            );
+                        let mut retries = 0;
+                        while let Err(ref e) = chunk {
+                            println!("{}", e);
+                            let fail_owned = match fail_semap.clone().try_acquire_owned() {
+                                Ok(owned) => owned,
+                                _ => {
+                                    CHANGE_SINGLE.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            };
+                            tokio::time::sleep(Duration::from_millis(retries * 100 + 100)).await;
+                            chunk = download_core(
+                                &client,
+                                &url,
+                                &filename,
+                                headers.clone(),
+                                start,
+                                segment_length,
+                                &progress_tx,
+                            )
+                            .await;
+                            retries += 1;
+                            drop(fail_owned);
+                        }
+                        drop(owned);
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .abort_handle(),
+                )
+                .await?;
         }
+        drop(join_tx);
         drop(progress_tx);
-        match res_rx.await {
-            Ok(_) => {
-                println!("\nDone.");
-                Ok(())
+
+        loop {
+            if CHANGE_SINGLE.load(Ordering::Relaxed) {
+                abort_handle.await?;
+                return self.single_download(length).await;
             }
-            Err(e) => Err(e.into()),
+            match res_rx.try_recv() {
+                Ok(_) => {
+                    println!("\nDone.");
+                    return Ok(());
+                }
+                Err(TryRecvError::Empty) => tokio::time::sleep(Duration::from_millis(100)).await,
+                _ => (),
+            }
         }
     }
 }
@@ -348,9 +387,7 @@ async fn download_core(
         progress_tx.send(-(written_len as isize)).await?;
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!(
-                "download chunk fail, expected length: {length}, written length: {written_len}"
-            ),
+            format!("download fail, expected length: {length}, written length: {written_len}"),
         )
         .into());
     }
